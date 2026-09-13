@@ -129,3 +129,21 @@ public:
 private:
     Cb m_cb;
 };
+
+// The windowed-mode counterpart: same shape, different completed-handler
+// interface. Both end up at BrowserWnd::SetupController().
+class WindowedControllerCompletedHandler final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>
+{
+public:
+    using Cb = std::function<void(HRESULT, ICoreWebView2Controller*)>;
+    explicit WindowedControllerCompletedHandler(Cb cb) : m_cb(std::move(cb)) {}
+    IFACEMETHODIMP Invoke(HRESULT hr, ICoreWebView2Controller* ctrl) override
+    {
+        if (m_cb) m_cb(hr, ctrl);
+        return S_OK;
+    }
+private:
+    Cb m_cb;
+};

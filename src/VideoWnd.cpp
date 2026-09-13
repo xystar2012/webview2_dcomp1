@@ -233,7 +233,27 @@ LRESULT VideoWnd::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         OnLButtonDown();
         return 0;
     case WM_NCHITTEST:
-        return HTTRANSPARENT;
+    {
+        // Two shapes, two answers.
+        //
+        // In composition mode BrowserWnd stretches this window across its whole
+        // client area and lets the page's alpha reveal the picture, so the window
+        // must stay transparent to hit testing - otherwise it would swallow every
+        // mouse message before BrowserWnd could route it.
+        //
+        // In windowed mode there is no alpha to lean on and BrowserWnd shrinks the
+        // window to the cut-out rectangle instead (see LayoutVideoWnd). Its client
+        // area is then no bigger than the picture itself, so HTCLIENT can only ever
+        // claim clicks that already belong to the GIF - which is what the pause
+        // toggle wants.
+        RECT rc{};
+        GetClientRect(h, &rc);
+        const bool clampedToPicture =
+            m_animator.IsLoaded() &&
+            (rc.right - rc.left) == static_cast<LONG>(m_animator.Width()) &&
+            (rc.bottom - rc.top) == static_cast<LONG>(m_animator.Height());
+        return clampedToPicture ? HTCLIENT : HTTRANSPARENT;
+    }
     }
     return DefWindowProcW(h, msg, wp, lp);
 }

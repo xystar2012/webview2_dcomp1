@@ -137,6 +137,52 @@ void BrowserWnd::UpdateWebViewBounds()
     dlog(buf);
 }
 
+void BrowserWnd::LayoutVideoWnd()
+{
+    if (!m_hwnd || !m_videoWnd) return;
+
+    // Two modes, two ways to arrive at the same picture on screen.
+    //
+    //   Composition - the page is a DComp visual, composited above every child
+    //                 HWND of this window. VideoWnd can therefore cover the whole
+    //                 client area and still be visible only where the HTML
+    //                 punches its transparent cut-out.
+    //
+    //   Windowed    - the controller owns an opaque child HWND and there is no
+    //                 per-pixel alpha to punch anything with, so covering the
+    //                 client area would bury the GIF under the page for good.
+    //                 Shrink VideoWnd to the cut-out rectangle and keep it above
+    //                 the controller's window instead: the GIF is drawn by a
+    //                 native window sitting on top of the page rather than
+    //                 showing through it.
+    //
+    // In both cases VideoWnd is raised to the top of the sibling z-order. In
+    // windowed mode that is what beats the controller's HWND; in composition
+    // mode it costs nothing, because the DComp visual is composited above all
+    // child windows regardless.
+    RECT v{};
+    if (m_mode == Mode::Composition)
+    {
+        RECT rc{}; GetClientRect(m_hwnd, &rc);
+        v = { 0, 0, std::max<LONG>(1, rc.right), std::max<LONG>(1, rc.bottom) };
+    }
+    else
+    {
+        v = VideoRectPx();
+    }
+
+    SetWindowPos(m_videoWnd, HWND_TOP, v.left, v.top,
+                 std::max<LONG>(1, v.right - v.left),
+                 std::max<LONG>(1, v.bottom - v.top),
+                 SWP_NOACTIVATE);
+
+    wchar_t buf[160];
+    std::swprintf(buf, 160, L"[BrowserWnd] VideoWnd layout mode=%s rect=(%ld,%ld)-(%ld,%ld)",
+                  m_mode == Mode::Composition ? L"composition" : L"windowed",
+                  v.left, v.top, v.right, v.bottom);
+    dlog(buf);
+}
+
 HRESULT BrowserWnd::InitDComp()
 {
     wchar_t buf[128];
@@ -203,22 +249,67 @@ void BrowserWnd::OnEnvCreated(HRESULT hr, ICoreWebView2Environment* env)
         return;
     }
 
-    m_ctrlHandler = Microsoft::WRL::Make<ControllerCompletedHandler>(
-        [this](HRESULT hr, ICoreWebView2CompositionController* c) {
-            OnControllerCreated(hr, c);
+    // Environment is up; build whichever controller m_mode asks for. If the
+    // user already flipped the switch the recorded mode wins here.
+    CreateControllerForMode();
+}
+
+HRESULT BrowserWnd::CreateControllerForMode()
+{
+    wchar_t buf[160];
+    if (!m_env) return E_UNEXPECTED;
+
+    m_switchInFlight = true;
+
+    if (m_mode == Mode::Composition)
+    {
+        if (!m_rootVisual)
+        {
+            dlog(L"[BrowserWnd] composition mode needs a root visual");
+            m_switchInFlight = false;
+            return E_UNEXPECTED;
+        }
+        if (!m_env3)
+        {
+            dlog(L"[BrowserWnd] Environment3 missing; cannot create a composition controller");
+            m_switchInFlight = false;
+            return E_NOINTERFACE;
+        }
+
+        m_ctrlHandler = Microsoft::WRL::Make<ControllerCompletedHandler>(
+            [this](HRESULT h, ICoreWebView2CompositionController* c) {
+                OnControllerCreated(h, c);
+            });
+        HRESULT hr = m_env3->CreateCoreWebView2CompositionController(
+            m_hwnd, m_ctrlHandler.Get());
+        std::swprintf(buf, 160, L"[BrowserWnd] CreateCompositionController hr=0x%08lx", hr);
+        dlog(buf);
+        if (FAILED(hr))
+        {
+            m_switchInFlight = false;
+            dlog(L"[BrowserWnd] CompositionController creation failed");
+        }
+        return hr;
+    }
+
+    m_winCtrlHandler = Microsoft::WRL::Make<WindowedControllerCompletedHandler>(
+        [this](HRESULT h, ICoreWebView2Controller* c) {
+            OnWindowedControllerCreated(h, c);
         });
-    hr = m_env3->CreateCoreWebView2CompositionController(
-        m_hwnd, m_ctrlHandler.Get());
-    std::swprintf(buf, 128, L"[BrowserWnd] CreateCompositionController hr=0x%08lx", hr);
+    HRESULT hr = m_env->CreateCoreWebView2Controller(m_hwnd, m_winCtrlHandler.Get());
+    std::swprintf(buf, 160, L"[BrowserWnd] CreateCoreWebView2Controller hr=0x%08lx", hr);
     dlog(buf);
     if (FAILED(hr))
     {
-        dlog(L"[BrowserWnd] CompositionController creation failed");
+        m_switchInFlight = false;
+        dlog(L"[BrowserWnd] windowed Controller creation failed");
     }
+    return hr;
 }
 
 void BrowserWnd::OnControllerCreated(HRESULT hr, ICoreWebView2CompositionController* raw)
 {
+    m_switchInFlight = false;
     wchar_t buf[128];
     std::swprintf(buf, 128, L"[BrowserWnd] OnControllerCreated hr=0x%08lx raw=%p", hr, raw);
     dlog(buf);
@@ -241,27 +332,61 @@ void BrowserWnd::OnControllerCreated(HRESULT hr, ICoreWebView2CompositionControl
         dlog(L"[BrowserWnd] Controller2 not available");
     }
 
-    // 1) Hand the WebView2 our DComp visual so it paints into our tree.
+    // Hand the WebView2 our DComp visual so it paints into our tree. This is
+    // the whole difference from the windowed path: alpha-blended page pixels
+    // land in a visual we control, instead of in an opaque child HWND.
     HRESULT hrb = m_compController->put_RootVisualTarget(m_rootVisual.Get());
     std::swprintf(buf, 128, L"[BrowserWnd] put_RootVisualTarget hr=0x%08lx", hrb);
     dlog(buf);
 
-    // 2) Bounds + visual clip. We use RAW_PIXELS so put_Bounds takes
-    //    physical pixels and the WebView2 renders at native resolution.
+    SetupController();
+}
+
+void BrowserWnd::OnWindowedControllerCreated(HRESULT hr, ICoreWebView2Controller* raw)
+{
+    m_switchInFlight = false;
+    wchar_t buf[128];
+    std::swprintf(buf, 128, L"[BrowserWnd] OnWindowedControllerCreated hr=0x%08lx raw=%p", hr, raw);
+    dlog(buf);
+    if (FAILED(hr) || !raw) return;
+
+    m_controller = raw;
+    if (FAILED(raw->QueryInterface(IID_PPV_ARGS(&m_controller3))))
+    {
+        dlog(L"[BrowserWnd] Controller3 not available");
+    }
+    if (FAILED(raw->QueryInterface(IID_PPV_ARGS(&m_controller2))))
+    {
+        dlog(L"[BrowserWnd] Controller2 not available");
+    }
+    // Deliberately no RootVisualTarget here: a windowed controller owns an
+    // opaque child HWND and has nowhere to put a visual.
+
+    SetupController();
+}
+
+void BrowserWnd::SetupController()
+{
+    wchar_t buf[192];
+    const bool composition = (m_mode == Mode::Composition);
+
+    // Bounds + visual clip. We use RAW_PIXELS so put_Bounds takes
+    // physical pixels and the WebView2 renders at native resolution.
     //
-    //    In RAW_PIXELS mode RasterizationScale does not resize the WebView -
-    //    it only decides how many physical pixels one CSS pixel covers. Left
-    //    at the DPI-derived default (1.5 on this 150% display) the page got a
-    //    719x496 CSS viewport, so every fixed px in style.css (including
-    //    --hole-size) landed somewhere other than where IsInHole() looks.
+    // In RAW_PIXELS mode RasterizationScale does not resize the WebView -
+    // it only decides how many physical pixels one CSS pixel covers. Left
+    // at the DPI-derived default (1.5 on this 150% display) the page got a
+    // 719x496 CSS viewport, so every fixed px in style.css (including
+    // --video-w / --video-h) landed somewhere other than where
+    // IsInVideoRect() looks.
     //
-    //    ShouldDetectMonitorScaleChanges has to be turned off FIRST: while it
-    //    is on, WebView2 re-derives RasterizationScale from the monitor DPI
-    //    and silently discards our pin, which is exactly what was happening.
+    // ShouldDetectMonitorScaleChanges has to be turned off FIRST: while it
+    // is on, WebView2 re-derives RasterizationScale from the monitor DPI
+    // and silently discards our pin, which is exactly what was happening.
     //
-    //    Do NOT move this into UpdateWebViewBounds(): that would recurse via
-    //    RasterizationScaleChanged -> OnDpiChanged() -> UpdateWebViewBounds()
-    //    and starve the message loop (the GIF would look frozen).
+    // Do NOT move this into UpdateWebViewBounds(): that would recurse via
+    // RasterizationScaleChanged -> OnDpiChanged() -> UpdateWebViewBounds()
+    // and starve the message loop (the GIF would look frozen).
     if (m_controller3)
     {
         HRESULT hrDetect = m_controller3->put_ShouldDetectMonitorScaleChanges(FALSE);
@@ -275,32 +400,46 @@ void BrowserWnd::OnControllerCreated(HRESULT hr, ICoreWebView2CompositionControl
     UpdateVisualBounds();
     UpdateWebViewBounds();
 
-    // 3) Transparent default background so the page can show through to VideoWnd.
+    // Default background. Composition mode wants a fully transparent page so
+    // the cut-out reveals VideoWnd. Windowed mode has no per-pixel alpha, so
+    // an opaque background is the honest setting - and it makes the cut-out
+    // visibly show "no GIF", which is the point of the side-by-side.
     if (m_controller2)
     {
-        COREWEBVIEW2_COLOR c = { 0, 0, 0, 0 };
+        COREWEBVIEW2_COLOR c{};
+        if (composition) { c.A = 0;   c.R = 0;   c.G = 0;   c.B = 0; }
+        else             { c.A = 255; c.R = 255; c.G = 255; c.B = 255; }
         m_controller2->put_DefaultBackgroundColor(c);
-        dlog(L"[BrowserWnd] put_DefaultBackgroundColor {0,0,0,0}");
+        std::swprintf(buf, 192, L"[BrowserWnd] put_DefaultBackgroundColor a=%u mode=%s",
+                      (unsigned)c.A, composition ? L"composition" : L"windowed");
+        dlog(buf);
     }
 
-    // 4) Composition-mode controllers start hidden. Show explicitly so the
-    //    first frame goes through.
+    // 4) Size and stack VideoWnd for this mode. Deliberately after put_Bounds()
+    //    above, because VideoRectPx() reads the controller's rasterization
+    //    scale, and before put_IsVisible() below so the GIF window is already
+    //    in place when the controller first shows.
+    LayoutVideoWnd();
+
+    // 5) Controllers start hidden. Show explicitly so the first frame goes
+    //    through.
     if (m_controller)
     {
         m_controller->put_IsVisible(TRUE);
         dlog(L"[BrowserWnd] put_IsVisible(TRUE)");
     }
 
-    // 5) Subscribe to events.
+    // 5) Subscribe to events. The tokens are kept so TeardownController can
+    //    unhook cleanly before the controller is closed.
     m_accelHandler = Microsoft::WRL::Make<AccelHandler>(
         [this](UINT vk) { OnAcceleratorKey(vk); });
-    m_controller->add_AcceleratorKeyPressed(m_accelHandler.Get(), nullptr);
+    m_controller->add_AcceleratorKeyPressed(m_accelHandler.Get(), &m_accelToken);
 
     m_rasterHandler = Microsoft::WRL::Make<RasterizationScaleHandler>(
         [this]() { OnDpiChanged(); });
     if (m_controller3)
     {
-        m_controller3->add_RasterizationScaleChanged(m_rasterHandler.Get(), nullptr);
+        m_controller3->add_RasterizationScaleChanged(m_rasterHandler.Get(), &m_rasterToken);
     }
 
     // 6) Pull ICoreWebView2 out and navigate.
@@ -310,20 +449,107 @@ void BrowserWnd::OnControllerCreated(HRESULT hr, ICoreWebView2CompositionControl
         m_webView = webView;
         m_navHandler = Microsoft::WRL::Make<NavCompletedHandler>(
             [this](HRESULT status, const wchar_t*) { OnNavCompleted(status); });
-        EventRegistrationToken navTok{};
-        webView->add_NavigationCompleted(m_navHandler.Get(), &navTok);
+        m_webView->add_NavigationCompleted(m_navHandler.Get(), &m_navToken);
         wchar_t urlBuf[512]; wcsncpy_s(urlBuf, m_url.c_str(), 511);
         std::swprintf(buf, 512, L"[BrowserWnd] Navigate URL=%s", urlBuf);
         dlog(buf);
-        hrb = m_webView->Navigate(m_url.c_str());
+        HRESULT hrb = m_webView->Navigate(m_url.c_str());
         std::swprintf(buf, 128, L"[BrowserWnd] Navigate hr=0x%08lx", hrb);
         dlog(buf);
     }
 
     // 7) Final commit so everything is wired and visible together.
-    hrb = m_dcompDevice->Commit();
-    std::swprintf(buf, 128, L"[BrowserWnd] DComp Commit hr=0x%08lx", hrb);
+    if (m_dcompDevice)
+    {
+        HRESULT hrb = m_dcompDevice->Commit();
+        std::swprintf(buf, 128, L"[BrowserWnd] DComp Commit hr=0x%08lx", hrb);
+        dlog(buf);
+    }
+}
+
+void BrowserWnd::TeardownController()
+{
+    if (!m_controller) return;
+    dlog(L"[BrowserWnd] TeardownController");
+
+    // Detach the root visual first. Closing the composition controller does
+    // not clear m_rootVisual, and an attached visual keeps the last frame
+    // pinned in our tree - which would sit there as a ghost over the windowed
+    // controller.
+    if (m_compController && m_rootVisual)
+    {
+        m_compController->put_RootVisualTarget(nullptr);
+    }
+    if (m_webView && m_navToken.value)
+    {
+        m_webView->remove_NavigationCompleted(m_navToken);
+    }
+    if (m_controller3 && m_rasterToken.value)
+    {
+        m_controller3->remove_RasterizationScaleChanged(m_rasterToken);
+    }
+    if (m_accelToken.value)
+    {
+        m_controller->remove_AcceleratorKeyPressed(m_accelToken);
+    }
+
+    // Close() is synchronous and tears down the child HWND / render process
+    // wiring, so nothing may touch m_controller after this line.
+    m_controller->Close();
+
+    m_navToken = {};
+    m_accelToken = {};
+    m_rasterToken = {};
+    m_webView.Reset();
+    m_controller.Reset();
+    m_controller2.Reset();
+    m_controller3.Reset();
+    m_compController.Reset();
+    m_accelHandler.Reset();
+    m_rasterHandler.Reset();
+    m_navHandler.Reset();
+    m_ctrlHandler.Reset();
+    m_winCtrlHandler.Reset();
+}
+
+void BrowserWnd::SetMode(Mode mode)
+{
+    if (mode == m_mode) return;
+
+    if (!m_env)
+    {
+        // Environment still coming up (or not started): just record the
+        // choice. OnEnvCreated builds the controller from m_mode.
+        m_mode = mode;
+        if (m_onModeChanged) m_onModeChanged(m_mode);
+        return;
+    }
+
+    if (m_switchInFlight)
+    {
+        dlog(L"[BrowserWnd] SetMode ignored: a switch is already in flight");
+        return;
+    }
+
+    wchar_t buf[128];
+    std::swprintf(buf, 128, L"[BrowserWnd] SetMode -> %s",
+                  mode == Mode::Composition ? L"Composition" : L"Windowed");
     dlog(buf);
+
+    TeardownController();
+    m_mode = mode;
+    // Move VideoWnd straight away rather than waiting for the new controller:
+    // the old one is already gone, so in windowed mode this keeps the GIF in
+    // the cut-out through the rebuild instead of letting the whole client area
+    // flash empty.
+    LayoutVideoWnd();
+    if (m_onModeChanged) m_onModeChanged(m_mode);
+    CreateControllerForMode();
+}
+
+void BrowserWnd::ToggleMode()
+{
+    SetMode(m_mode == Mode::Composition ? Mode::Windowed : Mode::Composition);
 }
 
 void BrowserWnd::Resize(const RECT& bounds)
@@ -361,6 +587,11 @@ void BrowserWnd::Resize(const RECT& bounds)
         UpdateVisualBounds();
         m_dcompDevice->Commit();
     }
+
+    // Last word on geometry and z-order: the cut-out moves with the client area,
+    // and in windowed mode the controller may have just resized its own child
+    // HWND above VideoWnd.
+    LayoutVideoWnd();
 }
 
 void BrowserWnd::OnAcceleratorKey(UINT vk)
