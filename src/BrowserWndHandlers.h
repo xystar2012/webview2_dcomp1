@@ -114,6 +114,34 @@ private:
     Cb m_cb;
 };
 
+// Raised by window.chrome.webview.postMessage() from the page. Used for the
+// one thing the host cannot work out for itself: whether a point inside the
+// cut-out belongs to a page control or to the GIF.
+class WebMessageHandler final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    ICoreWebView2WebMessageReceivedEventHandler>
+{
+public:
+    using Cb = std::function<void(const std::wstring& json)>;
+    explicit WebMessageHandler(Cb cb) : m_cb(std::move(cb)) {}
+    IFACEMETHODIMP Invoke(
+        ICoreWebView2*,
+        ICoreWebView2WebMessageReceivedEventArgs* args) override
+    {
+        if (!m_cb || !args) return S_OK;
+        LPWSTR raw = nullptr;
+        if (SUCCEEDED(args->get_WebMessageAsJson(&raw)) && raw)
+        {
+            std::wstring json(raw);
+            CoTaskMemFree(raw);
+            m_cb(json);
+        }
+        return S_OK;
+    }
+private:
+    Cb m_cb;
+};
+
 class ControllerCompletedHandler final : public Microsoft::WRL::RuntimeClass<
     Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
     ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler>

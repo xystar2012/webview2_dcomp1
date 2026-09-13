@@ -16,11 +16,14 @@ html, body {
   overflow: hidden;
 }
 
-/* The cut-out is the GIF's own size, centred. VideoWnd draws the GIF at 1:1
-   through it, so the cut-out and the picture coincide exactly - no scaling,
-   no cropping. --video-w/--video-h are set from JS so CSS can stay aligned
-   with BrowserWnd::kVideoWidthCss/kVideoHeightCss without recompiling. */
-:root { --video-w: 648px; --video-h: 338px; }
+/* The cut-out is a circle centred in the viewport, with the same diameter as
+   the GIF is wide. VideoWnd draws the GIF at 1:1, so the picture spans the
+   circle edge to edge horizontally and leaves VideoWnd's own background showing
+   above and below it. Circular rather than rectangular on purpose: it makes the
+   compositor carry a genuinely non-rectangular alpha edge instead of an
+   axis-aligned box. --hole-d is set from JS so CSS stays aligned with
+   BrowserWnd::kHoleDiameterCss without recompiling. */
+:root { --hole-d: 648px; }
 
 body::before {
   content: "";
@@ -33,29 +36,47 @@ body::before {
     radial-gradient(1200px 800px at 12% 8%, #ff3366 0%, transparent 60%),
     radial-gradient(900px 700px at 90% 100%, #00d4ff 0%, transparent 55%),
     linear-gradient(135deg, #ffd60a 0%, #ff006e 50%, #8338ec 100%);
-  /* Punch the GIF's rectangle out of the gradient. The first five points are
-     the full viewport, the next five the inner rectangle; with the evenodd
-     fill rule the inner ring cancels the outer one and leaves a hole. */
-  clip-path: polygon(
-    evenodd,
-    0 0, 100% 0, 100% 100%, 0 100%, 0 0,
-    calc(50% - var(--video-w) / 2) calc(50% - var(--video-h) / 2),
-    calc(50% - var(--video-w) / 2) calc(50% + var(--video-h) / 2),
-    calc(50% + var(--video-w) / 2) calc(50% + var(--video-h) / 2),
-    calc(50% + var(--video-w) / 2) calc(50% - var(--video-h) / 2),
-    calc(50% - var(--video-w) / 2) calc(50% - var(--video-h) / 2)
-  );
+  /* Punch the circle out of the gradient. Not a clip-path: polygon() only
+     produces straight edges, and the evenodd fill rule that made the old
+     rectangular hole work cannot be combined with the shape functions. A mask
+     expresses it in one line - alpha 0 inside the radius, opaque outside - and
+     gives a hard edge with a 1px feather so it does not alias. */
+  -webkit-mask-image: radial-gradient(circle at 50% 50%,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 0) calc(var(--hole-d) / 2 - 1px),
+    #000 calc(var(--hole-d) / 2));
+  mask-image: radial-gradient(circle at 50% 50%,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 0) calc(var(--hole-d) / 2 - 1px),
+    #000 calc(var(--hole-d) / 2));
   z-index: -1;
-  /* The gradient must NOT swallow pointer events - BrowserWnd does the hit
-     testing and forwards events to whichever layer owns the point. If the
-     gradient captured them, Chromium would handle the click itself and the
-     native window would never see it. */
+  /* Purely decorative: clicks must reach the page's own elements (the cards, or
+     .video-hit over the cut-out), never this backdrop. */
   pointer-events: none;
 }
 
-/* Layout for the visible chrome. The cut-out is 648x338 dead centre, which
-   leaves a 203px band top and bottom and a 215px band left and right - so the
-   side cards are narrow and everything interactive lives in a band. */
+/* Invisible click target over the cut-out, sized and placed from the same
+   --hole-d the mask uses, so it covers exactly the cleared area. z-index 0 puts
+   it above the gradient (-1) and below every card (1): a control that overlaps
+   the circle is still hit first, and only clicks on the empty part of the
+   circle reach here. This is the element that makes "click the GIF to pause"
+   work in both hosting modes, since in windowed mode the page's HWND is on top
+   and the native window can never receive a mouse message itself. */
+.video-hit {
+  position: fixed;
+  left: calc(50% - var(--hole-d) / 2);
+  top: calc(50% - var(--hole-d) / 2);
+  width: var(--hole-d);
+  height: var(--hole-d);
+  border-radius: 50%;
+  z-index: 0;
+  cursor: pointer;
+}
+
+/* Layout for the visible chrome. The cut-out is a 648px-wide circle dead centre,
+   which in this client area leaves a 215px band left and right but almost none
+   top and bottom - so the side cards are narrow, and nothing can be placed in
+   the top centre without overlapping the circle. */
 .page-header {
   position: fixed;
   top: 32px;
@@ -95,9 +116,10 @@ body::before {
 .card-left  { left:  24px; bottom: 40px; width: 180px; }
 .card-right { right: 24px; bottom: 40px; width: 180px; }
 
-/* Click-test card. Kept in the 203px-tall band above the cut-out (bottom edge
-   at y = 24 + ~134 = 158), so it never overlaps the GIF and every button is
-   on the page's own hit-testable area. */
+/* Click-test card. It deliberately overlaps the cut-out (button A sits over the
+   rim) - that is the case worth exercising, and it works because .video-hit is
+   at z-index 0, under every card. A click on the button beats the cut-out; only
+   a click on the empty part of the circle reaches the GIF. */
 .card-actions { top: 24px; right: 24px; width: 400px; }
 .card-actions .btn-row { display: flex; gap: 8px; margin-top: 8px; }
 .card-actions .btn-row .btn { flex: 1 1 0; width: auto; }

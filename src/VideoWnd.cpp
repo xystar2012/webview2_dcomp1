@@ -125,10 +125,10 @@ void VideoWnd::OnPaint()
 
     if (ID2D1Bitmap* bmp = m_animator.CurrentBitmap())
     {
-        // Drawn 1:1 and centred. The WebView2 above us cuts a hole exactly the
-        // GIF's own size at the same spot (BrowserWnd::VideoRectPx and
-        // --video-w / --video-h in style.css), so the picture lands inside the
-        // cut-out pixel for pixel - no scaling, no cropping.
+        // Drawn 1:1 and centred. The page above us cuts a circle of exactly the
+        // GIF's width out of itself at the same spot (--hole-d, set from
+        // index.html and used by style.css), so the picture spans that circle
+        // edge to edge - no scaling, no cropping.
         //
         // floor() keeps the blit on whole pixels; half-pixel offsets would
         // resample a 1:1 copy and soften it.
@@ -202,9 +202,12 @@ void VideoWnd::OnTimer()
 
 void VideoWnd::OnLButtonDown()
 {
-    // A click anywhere in the cut-out freezes the GIF; the next one resumes it.
-    // BrowserWnd routes these clicks here from its WM_NCHITTEST handler, so a
-    // click that lands on the picture never reaches the WebView2.
+    // A click on the cut-out freezes the GIF; the next one resumes it.
+    //
+    // This window never sees that click itself - in composition mode the page's
+    // visual is on top of it, and in windowed mode the page's HWND is - so
+    // BrowserWnd posts this message after the page reports the click through
+    // postMessage. See BrowserWnd::OnWebMessage().
     m_animator.TogglePaused();
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -233,27 +236,14 @@ LRESULT VideoWnd::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         OnLButtonDown();
         return 0;
     case WM_NCHITTEST:
-    {
-        // Two shapes, two answers.
+        // Always transparent to hit testing, in both modes.
         //
-        // In composition mode BrowserWnd stretches this window across its whole
-        // client area and lets the page's alpha reveal the picture, so the window
-        // must stay transparent to hit testing - otherwise it would swallow every
-        // mouse message before BrowserWnd could route it.
-        //
-        // In windowed mode there is no alpha to lean on and BrowserWnd shrinks the
-        // window to the cut-out rectangle instead (see LayoutVideoWnd). Its client
-        // area is then no bigger than the picture itself, so HTCLIENT can only ever
-        // claim clicks that already belong to the GIF - which is what the pause
-        // toggle wants.
-        RECT rc{};
-        GetClientRect(h, &rc);
-        const bool clampedToPicture =
-            m_animator.IsLoaded() &&
-            (rc.right - rc.left) == static_cast<LONG>(m_animator.Width()) &&
-            (rc.bottom - rc.top) == static_cast<LONG>(m_animator.Height());
-        return clampedToPicture ? HTCLIENT : HTTRANSPARENT;
-    }
+        // This window fills the client area and the page draws over it, so it is
+        // never the window that should own a point: letting it claim HTCLIENT
+        // would swallow mouse messages that belong to the page. Clicks that do
+        // belong to the GIF arrive as a posted WM_LBUTTONDOWN from BrowserWnd,
+        // not through hit testing.
+        return HTTRANSPARENT;
     }
     return DefWindowProcW(h, msg, wp, lp);
 }

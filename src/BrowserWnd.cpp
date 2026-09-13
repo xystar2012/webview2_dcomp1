@@ -34,6 +34,21 @@ namespace
                 std::streamsize(line.size() * sizeof(wchar_t)));
         OutputDebugStringW(msg);
     }
+
+    // First Chrome_WidgetWin_* child of w, ignoring skip. WebView2 nests these
+    // wrapper windows, so "the window that paints the page" is found by
+    // following them down as far as they go.
+    HWND FirstChromeChild(HWND w, HWND skip)
+    {
+        for (HWND c = GetWindow(w, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
+        {
+            if (c == skip) continue;
+            wchar_t cls[128]{};
+            if (GetClassNameW(c, cls, 128) == 0) continue;
+            if (std::wstring(cls).rfind(L"Chrome_WidgetWin_", 0) == 0) return c;
+        }
+        return nullptr;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,50 +152,136 @@ void BrowserWnd::UpdateWebViewBounds()
     dlog(buf);
 }
 
+HWND BrowserWnd::FindPageWnd() const
+{
+    if (!m_hwnd) return nullptr;
+    HWND page = FirstChromeChild(m_hwnd, m_videoWnd);
+    while (page)
+    {
+        HWND deeper = FirstChromeChild(page, m_videoWnd);
+        if (!deeper) break;
+        page = deeper;
+    }
+    return page;
+}
+
 void BrowserWnd::LayoutVideoWnd()
 {
     if (!m_hwnd || !m_videoWnd) return;
 
-    // Two modes, two ways to arrive at the same picture on screen.
+    // Both modes fill the whole area; what differs is the parent and the
+    // stacking, because a child HWND is only ordered against its own siblings.
     //
-    //   Composition - the page is a DComp visual, composited above every child
-    //                 HWND of this window. VideoWnd can therefore cover the whole
-    //                 client area and still be visible only where the HTML
-    //                 punches its transparent cut-out.
+    //   Composition - the page is a DComp visual, composited above *every* child
+    //                 HWND of this window, so VideoWnd is visible only where the
+    //                 HTML punches its transparent circle. Remaining a child of
+    //                 ours and filling the client area is enough.
     //
-    //   Windowed    - the controller owns an opaque child HWND and there is no
-    //                 per-pixel alpha to punch anything with, so covering the
-    //                 client area would bury the GIF under the page for good.
-    //                 Shrink VideoWnd to the cut-out rectangle and keep it above
-    //                 the controller's window instead: the GIF is drawn by a
-    //                 native window sitting on top of the page rather than
-    //                 showing through it.
+    //   Windowed    - the page is an opaque child HWND, so the only way the GIF
+    //                 can show is for the compositor to blend the two windows
+    //                 using the page's alpha. That needs VideoWnd to be an actual
+    //                 sibling of the window that paints the page. The controller
+    //                 nests that window below us:
     //
-    // In both cases VideoWnd is raised to the top of the sibling z-order. In
-    // windowed mode that is what beats the controller's HWND; in composition
-    // mode it costs nothing, because the DComp visual is composited above all
-    // child windows regardless.
-    RECT v{};
-    if (m_mode == Mode::Composition)
+    //                   BrowserWnd
+    //                     Chrome_WidgetWin_0          <- wrapper, our child
+    //                       Chrome_WidgetWin_1        <- paints the page
+    //                         Chrome_RenderWidgetHostHWND
+    //                         Intermediate D3D Window
+    //
+    //                 Re-parent VideoWnd into Chrome_WidgetWin_1 so it is a real
+    //                 sibling of the render windows, then drop it to the bottom
+    //                 of that sibling order - underneath the page.
+    HWND target = m_hwnd;
+    if (m_mode == Mode::Windowed)
     {
-        RECT rc{}; GetClientRect(m_hwnd, &rc);
-        v = { 0, 0, std::max<LONG>(1, rc.right), std::max<LONG>(1, rc.bottom) };
-    }
-    else
-    {
-        v = VideoRectPx();
+        if (HWND page = FindPageWnd()) target = page;
     }
 
-    SetWindowPos(m_videoWnd, HWND_TOP, v.left, v.top,
-                 std::max<LONG>(1, v.right - v.left),
-                 std::max<LONG>(1, v.bottom - v.top),
+    const HWND wasParent = GetParent(m_videoWnd);
+    const bool reparented = (wasParent != target);
+    if (reparented)
+    {
+        // SetParent keeps the screen position, so the geometry below is what
+        // actually lands the window.
+        SetParent(m_videoWnd, target);
+    }
+
+    // Size to *our* client area, not to the target's own client rect. Queried
+    // mid-init, Chrome_WidgetWin_1 reported a client of 1608x1529 and VideoWnd
+    // came out that size, poking far outside the window; Chromium only settles
+    // it to the real 1078x700 afterwards. Our client area is what both windows
+    // end up covering, and it never lies. The origin is (0,0) either way:
+    // Chrome_WidgetWin_1 is frameless and sits at our client origin.
+    RECT rc{}; GetClientRect(m_hwnd, &rc);
+    const int w = std::max<LONG>(1, rc.right - rc.left);
+    const int h = std::max<LONG>(1, rc.bottom - rc.top);
+
+    SetWindowPos(m_videoWnd,
+                 m_mode == Mode::Composition ? HWND_TOP : HWND_BOTTOM,
+                 0, 0, w, h,
                  SWP_NOACTIVATE);
 
-    wchar_t buf[160];
-    std::swprintf(buf, 160, L"[BrowserWnd] VideoWnd layout mode=%s rect=(%ld,%ld)-(%ld,%ld)",
+    wchar_t buf[192];
+    std::swprintf(buf, 192,
+                  L"[BrowserWnd] VideoWnd layout mode=%s parent=%p(%s) rect=0,0,%dx%d settled=%d",
                   m_mode == Mode::Composition ? L"composition" : L"windowed",
-                  v.left, v.top, v.right, v.bottom);
+                  (void*)GetParent(m_videoWnd), reparented ? L"reparented" : L"same", w, h,
+                  VideoStackSettled() ? 1 : 0);
     dlog(buf);
+}
+
+bool BrowserWnd::VideoStackSettled() const
+{
+    if (m_mode != Mode::Windowed || !m_videoWnd) return true;
+
+    HWND parent = GetParent(m_videoWnd);
+    if (!parent || parent == m_hwnd) return false;   // not re-parented yet
+
+    // The page is presented through Chromium's own D3D child, not through the
+    // render widget host, and that child is created late. Until it exists there
+    // is nothing meaningful to sit under, and "bottom-most" would be true for
+    // the wrong reason.
+    bool sawPresenter = false;
+    HWND last = nullptr;
+    for (HWND c = GetWindow(parent, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
+    {
+        wchar_t cls[128]{};
+        if (GetClassNameW(c, cls, 128) > 0 &&
+            std::wstring(cls) == L"Intermediate D3D Window")
+        {
+            sawPresenter = true;
+        }
+        last = c;   // GW_HWNDNEXT walks down the z-order, so this ends bottom-most
+    }
+    return sawPresenter && last == m_videoWnd;
+}
+
+void BrowserWnd::ArmVideoStackWatch()
+{
+    if (!m_hwnd || m_mode != Mode::Windowed) return;
+    m_videoStackTicksLeft = kVideoStackWatchTicks;
+    SetTimer(m_hwnd, kVideoStackWatchTimer, 250, nullptr);
+}
+
+void BrowserWnd::AttachRootVisual(bool attach)
+{
+    if (!m_dcompTarget) return;
+
+    // Detaching matters when leaving composition mode. The visual is composited
+    // above *every* child HWND of this window, and closing the composition
+    // controller does not empty it: left attached it goes on showing the last
+    // frame it was given. That frozen copy of the page then sits on top of the
+    // windowed controller's own HWND, which reads exactly like the page failing
+    // to render, or - worse, because it looks convincing - like the windowed
+    // controller honouring the page's alpha when it is really showing a stale
+    // composition.
+    HRESULT hr = m_dcompTarget->SetRoot(attach ? m_rootVisual.Get() : nullptr);
+    wchar_t buf[128];
+    std::swprintf(buf, 128, L"[BrowserWnd] SetRoot(%s) hr=0x%08lx",
+                  attach ? L"visual" : L"null", hr);
+    dlog(buf);
+    if (m_dcompDevice) m_dcompDevice->Commit();
 }
 
 HRESULT BrowserWnd::InitDComp()
@@ -276,6 +377,10 @@ HRESULT BrowserWnd::CreateControllerForMode()
             return E_NOINTERFACE;
         }
 
+        // The page can only be seen through the visual, so it has to be back in
+        // the tree before the controller starts painting into it.
+        AttachRootVisual(true);
+
         m_ctrlHandler = Microsoft::WRL::Make<ControllerCompletedHandler>(
             [this](HRESULT h, ICoreWebView2CompositionController* c) {
                 OnControllerCreated(h, c);
@@ -291,6 +396,11 @@ HRESULT BrowserWnd::CreateControllerForMode()
         }
         return hr;
     }
+
+    // Nothing is painted into the visual in this mode, so take it out of the
+    // tree rather than leave the last composition frame frozen on top of the
+    // windowed controller's HWND.
+    AttachRootVisual(false);
 
     m_winCtrlHandler = Microsoft::WRL::Make<WindowedControllerCompletedHandler>(
         [this](HRESULT h, ICoreWebView2Controller* c) {
@@ -377,8 +487,7 @@ void BrowserWnd::SetupController()
     // it only decides how many physical pixels one CSS pixel covers. Left
     // at the DPI-derived default (1.5 on this 150% display) the page got a
     // 719x496 CSS viewport, so every fixed px in style.css (including
-    // --video-w / --video-h) landed somewhere other than where
-    // IsInVideoRect() looks.
+    // --hole-d) landed somewhere other than the physical pixels it meant.
     //
     // ShouldDetectMonitorScaleChanges has to be turned off FIRST: while it
     // is on, WebView2 re-derives RasterizationScale from the monitor DPI
@@ -401,14 +510,15 @@ void BrowserWnd::SetupController()
     UpdateWebViewBounds();
 
     // Default background. Composition mode wants a fully transparent page so
-    // the cut-out reveals VideoWnd. Windowed mode has no per-pixel alpha, so
-    // an opaque background is the honest setting - and it makes the cut-out
-    // visibly show "no GIF", which is the point of the side-by-side.
+    // the cut-out reveals VideoWnd.
+    //
+    // EXPERIMENT: windowed mode now asks for the transparent background too, so
+    // that the only variable left is whether the windowed controller's opaque
+    // child HWND can carry that alpha through to the compositor.
     if (m_controller2)
     {
         COREWEBVIEW2_COLOR c{};
-        if (composition) { c.A = 0;   c.R = 0;   c.G = 0;   c.B = 0; }
-        else             { c.A = 255; c.R = 255; c.G = 255; c.B = 255; }
+        c.A = 0; c.R = 0; c.G = 0; c.B = 0;
         m_controller2->put_DefaultBackgroundColor(c);
         std::swprintf(buf, 192, L"[BrowserWnd] put_DefaultBackgroundColor a=%u mode=%s",
                       (unsigned)c.A, composition ? L"composition" : L"windowed");
@@ -416,10 +526,13 @@ void BrowserWnd::SetupController()
     }
 
     // 4) Size and stack VideoWnd for this mode. Deliberately after put_Bounds()
-    //    above, because VideoRectPx() reads the controller's rasterization
-    //    scale, and before put_IsVisible() below so the GIF window is already
-    //    in place when the controller first shows.
+    //    above so there is no window left at the wrong size, and before
+    //    put_IsVisible() below so the GIF window is already in place when the
+    //    controller first shows.
     LayoutVideoWnd();
+    // Chromium has not built its presenting window yet at this point, so this
+    // layout cannot be the last word; keep re-asserting until it exists.
+    ArmVideoStackWatch();
 
     // 5) Controllers start hidden. Show explicitly so the first frame goes
     //    through.
@@ -450,6 +563,11 @@ void BrowserWnd::SetupController()
         m_navHandler = Microsoft::WRL::Make<NavCompletedHandler>(
             [this](HRESULT status, const wchar_t*) { OnNavCompleted(status); });
         m_webView->add_NavigationCompleted(m_navHandler.Get(), &m_navToken);
+
+        // The page tells us when a click belongs to the GIF rather than to it.
+        m_msgHandler = Microsoft::WRL::Make<WebMessageHandler>(
+            [this](const std::wstring& json) { OnWebMessage(json); });
+        m_webView->add_WebMessageReceived(m_msgHandler.Get(), &m_msgToken);
         wchar_t urlBuf[512]; wcsncpy_s(urlBuf, m_url.c_str(), 511);
         std::swprintf(buf, 512, L"[BrowserWnd] Navigate URL=%s", urlBuf);
         dlog(buf);
@@ -472,6 +590,14 @@ void BrowserWnd::TeardownController()
     if (!m_controller) return;
     dlog(L"[BrowserWnd] TeardownController");
 
+    // The stack it was watching is about to disappear; the next controller
+    // arms its own watch.
+    if (m_hwnd)
+    {
+        KillTimer(m_hwnd, kVideoStackWatchTimer);
+        m_videoStackTicksLeft = 0;
+    }
+
     // Detach the root visual first. Closing the composition controller does
     // not clear m_rootVisual, and an attached visual keeps the last frame
     // pinned in our tree - which would sit there as a ghost over the windowed
@@ -484,6 +610,10 @@ void BrowserWnd::TeardownController()
     {
         m_webView->remove_NavigationCompleted(m_navToken);
     }
+    if (m_webView && m_msgToken.value)
+    {
+        m_webView->remove_WebMessageReceived(m_msgToken);
+    }
     if (m_controller3 && m_rasterToken.value)
     {
         m_controller3->remove_RasterizationScaleChanged(m_rasterToken);
@@ -493,6 +623,16 @@ void BrowserWnd::TeardownController()
         m_controller->remove_AcceleratorKeyPressed(m_accelToken);
     }
 
+    // VideoWnd may be parented into the controller's Chromium wrapper (see
+    // LayoutVideoWnd). That wrapper is destroyed along with the controller and
+    // would take VideoWnd - which outlives the controller - down with it, so
+    // move it back under us first.
+    if (m_videoWnd && GetParent(m_videoWnd) != m_hwnd)
+    {
+        SetParent(m_videoWnd, m_hwnd);
+        dlog(L"[BrowserWnd] TeardownController: VideoWnd re-parented back under BrowserWnd");
+    }
+
     // Close() is synchronous and tears down the child HWND / render process
     // wiring, so nothing may touch m_controller after this line.
     m_controller->Close();
@@ -500,6 +640,7 @@ void BrowserWnd::TeardownController()
     m_navToken = {};
     m_accelToken = {};
     m_rasterToken = {};
+    m_msgToken = {};
     m_webView.Reset();
     m_controller.Reset();
     m_controller2.Reset();
@@ -508,6 +649,7 @@ void BrowserWnd::TeardownController()
     m_accelHandler.Reset();
     m_rasterHandler.Reset();
     m_navHandler.Reset();
+    m_msgHandler.Reset();
     m_ctrlHandler.Reset();
     m_winCtrlHandler.Reset();
 }
@@ -543,6 +685,7 @@ void BrowserWnd::SetMode(Mode mode)
     // the cut-out through the rebuild instead of letting the whole client area
     // flash empty.
     LayoutVideoWnd();
+    ArmVideoStackWatch();
     if (m_onModeChanged) m_onModeChanged(m_mode);
     CreateControllerForMode();
 }
@@ -631,39 +774,20 @@ void BrowserWnd::OnDpiChanged()
     }
 }
 
-RECT BrowserWnd::VideoRectPx() const
+void BrowserWnd::OnWebMessage(const std::wstring& json)
 {
-    // kVideoWidthCss/kVideoHeightCss are in CSS pixels, the same unit
-    // style.css uses. Hit testing happens in client (physical) pixels, so
-    // convert through the controller's actual rasterization scale.
-    //
-    // That scale is pinned to 1.0 in OnControllerCreated(), which normally
-    // makes this a plain 1:1 mapping. Reading it back instead of hardcoding
-    // 1.0 means that if the pin is ever dropped - a DPI change, a future
-    // runtime that overrides it - the clickable region still lines up with
-    // the cut-out that is actually drawn, rather than silently swallowing
-    // clicks on a band around it.
-    double scale = 1.0;
-    if (m_controller3)
-    {
-        double s = 0.0;
-        if (SUCCEEDED(m_controller3->get_RasterizationScale(&s)) && s > 0.0) scale = s;
-    }
+    // The page fires this from the invisible element it keeps over the cut-out,
+    // so it means "this click was on the GIF's area, not on any control".
+    if (json.find(L"video-toggle") == std::wstring::npos) return;
+    if (!m_videoWnd) return;
 
-    RECT rc{}; GetClientRect(m_hwnd, &rc);
-    LONG w = (LONG)(kVideoWidthCss  * scale);
-    LONG h = (LONG)(kVideoHeightCss * scale);
-    LONG left = (rc.right  - rc.left - w) / 2;
-    LONG top  = (rc.bottom - rc.top  - h) / 2;
-    RECT r = { left, top, left + w, top + h };
-    return r;
-}
-
-bool BrowserWnd::IsInVideoRect(POINT pt) const
-{
-    RECT r = VideoRectPx();
-    return pt.x >= r.left && pt.x < r.right &&
-           pt.y >= r.top  && pt.y < r.bottom;
+    static int s_toggles = 0;
+    wchar_t buf[128];
+    std::swprintf(buf, 128, L"[BrowserWnd] page reports a click on the GIF area (#%d)", ++s_toggles);
+    dlog(buf);
+    // Posted, not sent: the toggle repaints VideoWnd, and doing that inside the
+    // WebView2's callback would re-enter the browser while it is dispatching.
+    PostMessageW(m_videoWnd, WM_LBUTTONDOWN, 0, 0);
 }
 
 void BrowserWnd::SendMouseToWebView(UINT msg, WPARAM wParam, POINT clientPt)
@@ -733,6 +857,28 @@ LRESULT BrowserWnd::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
     {
+    case WM_TIMER:
+        if (wp == kVideoStackWatchTimer)
+        {
+            // The stack is only worth re-asserting while it is still wrong;
+            // once it settles, drop the timer rather than fight Chromium.
+            if (m_mode == Mode::Windowed &&
+                !VideoStackSettled() &&
+                m_videoStackTicksLeft > 0)
+            {
+                --m_videoStackTicksLeft;
+                LayoutVideoWnd();
+            }
+            else
+            {
+                KillTimer(h, kVideoStackWatchTimer);
+                m_videoStackTicksLeft = 0;
+                dlog(L"[BrowserWnd] VideoWnd stack settled; watch stopped");
+            }
+            return 0;
+        }
+        break;
+
     case WM_PAINT:
     {
         PAINTSTRUCT ps;
@@ -779,17 +925,14 @@ LRESULT BrowserWnd::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         // Mouse input. The window has no mouse-in-pointer promotion, so mouse
         // clicks arrive here as legacy messages (the WM_POINTER* branch above
         // only sees touch and pen).
+        //
+        // Everything goes to the page, including points inside the cut-out.
+        // Deciding "page or GIF" by geometry here is what made buttons that
+        // overlap the cut-out dead: the host cannot see what the page has drawn
+        // at a point, so it cannot know whether the pixel under the pointer
+        // belongs to a control. The page can, and says so by postMessage - see
+        // OnWebMessage().
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-
-        // Inside the cut-out the page is transparent, so hand the message to
-        // the native window that is showing through instead.
-        if (IsInVideoRect(pt))
-        {
-            if (!m_videoWnd) break;
-            MapWindowPoints(h, m_videoWnd, &pt, 1);
-            return SendMessageW(m_videoWnd, msg, wp, MAKELPARAM(pt.x, pt.y));
-        }
-
         SendMouseToWebView(msg, wp, pt);
         return 0;
     }
@@ -800,15 +943,6 @@ LRESULT BrowserWnd::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         // coordinates, not client ones.
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(h, &pt);
-
-        if (IsInVideoRect(pt))
-        {
-            if (!m_videoWnd) break;
-            POINT vpt = pt;
-            MapWindowPoints(h, m_videoWnd, &vpt, 1);
-            return SendMessageW(m_videoWnd, msg, wp, MAKELPARAM(vpt.x, vpt.y));
-        }
-
         SendMouseToWebView(msg, wp, pt);
         return 0;
     }

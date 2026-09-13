@@ -8,14 +8,21 @@ GIF 如何出现在页面的挖孔里，以及为什么两种模式需要完全�
 ```
 MainWnd                     顶层窗口 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN
 ├── BrowserWnd              占据客户区「减去底部 44px 条带」的区域
-│   ├── VideoWnd            绘制 GIF 的原生窗口（D2D HwndRenderTarget）
-│   └── Chrome_WidgetWin_1  仅窗口模式下存在，由 ICoreWebView2Controller 创建
+│   ├── VideoWnd            composition 模式下在这里，铺满客户区
+│   └── Chrome_WidgetWin_0  windowed 模式下由 controller 创建
+│       └── Chrome_WidgetWin_1
+│           ├── Chrome_RenderWidgetHostHWND
+│           ├── Intermediate D3D Window
+│           └── VideoWnd     windowed 模式下重挂到这里，压在最底
 ├── BUTTON  (id 1001)       条带左侧，切换 WebView2 托管模式
 └── STATIC  (id 1002)       条带右侧，当前模式的说明文字
 ```
 
-`BrowserWnd` 拥有一个 DirectComposition root visual，WebView2 的页面渲染进这个
-visual。`VideoWnd` 是 `BrowserWnd` 的子窗口，GIF 由它绘制。
+`BrowserWnd` 拥有一个 DirectComposition root visual，composition 模式下 WebView2
+的页面渲染进这个 visual，`VideoWnd` 是它的子窗口、铺满客户区。
+
+windowed 模式下页面画在不透明的子 HWND 里，`VideoWnd` 会被**重挂**到最里面那个
+`Chrome_WidgetWin_1` 下、压到最底，让合成器用页面的 alpha 去混合——见第 4 节。
 
 ### 为什么底部必须留一条 44px 的条带
 
@@ -31,9 +38,9 @@ DirectComposition 的 visual 是**合成在本窗口所有子 HWND 之上**的�
 | 创建接口 | `ICoreWebView2Environment3::CreateCoreWebView2CompositionController` | `ICoreWebView2Environment::CreateCoreWebView2Controller` |
 | 页面渲染到 | 本窗口的 `IDCompositionVisual` | 自己创建的**不透明子 HWND**（`Chrome_WidgetWin_1`） |
 | 逐像素 alpha | 支持 | **不支持**，整个 HWND 不透明 |
-| `put_DefaultBackgroundColor` | `{0,0,0,0}`（全透明） | `{255,255,255,255}`（不透明） |
+| `put_DefaultBackgroundColor` | `{0,0,0,0}`（全透明） | 目前也设 `{0,0,0,0}`（实验：让唯一变量变成"不透明子 HWND 能否传递 alpha"） |
 | 鼠标 | 需要宿主用 `SendMouseInput` 转发 | 自己的子 HWND 直接接收 |
-| 挖孔如何显示 GIF | 页面 alpha 让出，露出下面的原生层 | 页面上方贴一个裁剪到挖孔的原生窗口 |
+| 挖孔如何显示 GIF | 页面 alpha 让出，露出下面的原生层 | `VideoWnd` 重挂到页面窗口下、压到最底，由合成器按页面 alpha 混合 |
 
 两者不能同时存在：切换模式会 `Close()` 掉当前 controller 再重建一个，因此页面会
 重新从 `m_url` 加载，页面内状态（计数等）会丢失。切换期间 `m_switchInFlight`
@@ -43,8 +50,8 @@ DirectComposition 的 visual 是**合成在本窗口所有子 HWND 之上**的�
 
 `put_ShouldDetectMonitorScaleChanges(FALSE)` **必须在** `put_RasterizationScale(1.0f)`
 之前调用。否则 WebView2 会从显示器 DPI 重新推导 scale，把 pin 值丢掉——之前页面
-拿到的是 719x496 的 CSS 视口，`style.css` 里所有固定 px（包括 `--video-w` /
-`--video-h`）都落不到 `IsInVideoRect()` 期望的位置。
+拿到的是 719x496 的 CSS 视口，`style.css` 里所有固定 px（包括 `--hole-d`）都跟
+物理像素对不上，挖孔和 `.video-hit` 也就对不齐了。
 
 这段代码**不能**放进 `UpdateWebViewBounds()`：那会经由
 `RasterizationScaleChanged` → `OnDpiChanged()` → `UpdateWebViewBounds()` 无限递归，
@@ -52,21 +59,26 @@ DirectComposition 的 visual 是**合成在本窗口所有子 HWND 之上**的�
 
 ## 3. 挖孔（cut-out）
 
-页面中央有一个 648×338 的矩形挖孔，尺寸等于 GIF 原始尺寸。C++ 与 CSS 必须同步：
+页面中央有一个**直径 648px 的圆形**挖孔，直径等于 GIF 的宽度。GIF 按 1:1 画在圆
+里，横向正好铺满，上下露出 `VideoWnd` 自己的底色。做成圆的而不是方的，是为了让
+合成器真正去处理一条非矩形的 alpha 边，而不是一个轴对齐的方框。
 
-- `BrowserWnd.h`：`kVideoWidthCss = 648.0` / `kVideoHeightCss = 338.0`
-- `html/style.css`：`--video-w: 648px` / `--video-h: 338px`
-- `html/index.html`：JS `setProperty('--video-w'/'--video-h', ...)`
+尺寸只由页面一处决定：
 
-CSS 用 `clip-path: polygon(evenodd, <外框>, <内框>)`，内框位置是
-`calc(50% - var(--video-w) / 2)`，即居中。
+- `html/index.html`：JS `setProperty('--hole-d', '648px')`
+- `html/style.css`：`--hole-d` 的默认值，以及用它的 `mask-image`
 
-因为 rasterization scale 被 pin 到 1.0，CSS 像素 == 物理像素，所以挖孔在客户区里
-就是一个居中的 648×338 矩形。`BrowserWnd::VideoRectPx()` 返回的正是同一个矩形
-（读数方式仍然走 `get_RasterizationScale()`，而不是硬编码 1.0，这样一旦 pin 被
-丢掉，点击区域会跟着实际渲染走，而不是在挖孔周围悄悄多出一圈点不动的边）。
+C++ 侧**不再**持有挖孔几何。宿主不按几何分派点击（见第 5 节），所以它不需要知道
+挖孔在哪——只有页面需要，而页面已经知道了。
 
-实测（客户区 1078×700）：挖孔 = `(215,181)-(863,519)`。
+CSS 用 `mask-image: radial-gradient(circle, ...)`：半径内 alpha 0、半径外不透明，
+最后 1px 做羽化防锯齿。**不能**用 `clip-path`——`polygon()` 只能出直线边，而
+`evenodd` 填充规则又没法跟形状函数（`circle()` 等）组合。
+
+因为 rasterization scale 被 pin 到 1.0，CSS 像素 == 物理像素，所以这个圆在客户区
+里就是正圆，`.video-hit` 也能和它精确对齐。
+
+实测（客户区 1078×700，圆盘占满大半）：圆心 `(539,350)`、半径 324。
 
 ## 4. GIF 怎么显示出来
 
@@ -81,49 +93,86 @@ CSS 用 `clip-path: polygon(evenodd, <外框>, <内框>)`，内框位置是
 ### Windowed 模式
 
 没有 alpha 可用：controller 的子 HWND 是不透明的，页面上的透明挖孔只会露出它自己
-的白色底。**这里不存在真正的"穿透"**，所以改用几何代替 alpha——
+的底。**这里不存在真正的"穿透"**，改成把 `VideoWnd` 移动到**真正绘制页面的那个
+窗口**下面，做它的兄弟，让合成器拿页面的 alpha 去混合两层。
 
-`BrowserWnd::LayoutVideoWnd()` 把 `VideoWnd` 缩小到正好等于挖孔矩形，再把它
-`HWND_TOP` 压在 controller 的 HWND 之上。GIF 由「一个贴在页面上方的原生窗口」
-绘制，而不是从页面下面透出来，最终像素与 composition 模式一致。
+Chromium 的窗口是嵌套的，`VideoWnd` 要挂到最里面那个：
 
-两种模式的几何都由 `LayoutVideoWnd()` 统一决定，它在三处被调用：
+```
+webview2_dcomp1.BrowserWnd
+  Chrome_WidgetWin_0                 <- 包裹层，本窗口的直接子窗口
+    Chrome_WidgetWin_1               <- 页面绘制在这里
+      Chrome_RenderWidgetHostHWND
+      Intermediate D3D Window        <- 真正呈现页面的那个窗口（后建）
+```
+
+`LayoutVideoWnd()` 把 `VideoWnd` `SetParent` 到 `Chrome_WidgetWin_1`，然后
+`HWND_BOTTOM` 压到该窗口子链的最底。两种模式都铺满整个客户区，区别只在父窗口和
+叠放次序——因为子 HWND 只跟自己的兄弟比 z-order。
 
 - `Resize()` 末尾——挖孔随客户区移动，且窗口模式下 controller 可能刚把自己
-  的子 HWND 调整过 z-order；
+  的子 HWND 调整过；
 - `SetMode()` 里 `m_mode` 改变之后——旧 controller 已经拆掉，立刻摆放可以让
   GIF 在重建期间不闪空；
-- `SetupController()` 里 `put_Bounds()` 之后、`put_IsVisible(TRUE)` 之前——
-  `VideoRectPx()` 要读 controller 的 scale，而第一帧显示之前窗口就该就位。
+- `SetupController()` 里 `put_Bounds()` 之后、`put_IsVisible(TRUE)` 之前；
+- `ArmVideoStackWatch()` 的 250ms 定时器——见下。
 
-> 这里曾经的错误做法是把 `VideoWnd` 压到 z-order 底部来解决"窗口模式下浏览器被
-> 盖住"。那确实让浏览器可见了，代价是 GIF 被不透明的页面 HWND 永久盖住。
+> **不能挂在 `Chrome_WidgetWin_0` 下。** 试过：挂在那里并压到最底，GIF 会**冻住**
+> （前后两张截图逐字节相同）。被上面那层不透明的兄弟窗口完全覆盖后，DWM 判定它
+> 不可见、不再重合成。挂在 `Chrome_WidgetWin_1` 下就好了，因为压住它的是分层的
+> `Intermediate D3D Window`，带 alpha，混合照常。
+>
+> **`Intermediate D3D Window` 是后建的。** `SetupController()` 里那次布局一定早于
+> 它，于是它一出现就把 `VideoWnd` 盖住——表现是**只有 resize 过主窗口才正常**
+> （resize 会再跑一次布局）。`ArmVideoStackWatch()` 用定时器反复重排直到
+> `VideoStackSettled()` 为真（该窗口已存在**且** `VideoWnd` 是子链最后一项），
+> settle 后即 `KillTimer`，不是常驻轮询。
+
+尺寸取**自己的** `GetClientRect()`：`Chrome_WidgetWin_1` 初始化中途会报出
+1608×1529 的临时客户区，照它给尺寸会让 `VideoWnd` 捅到窗口外。
 
 ## 5. 鼠标路由
+
+**宿主不按几何猜点击归属。** 只有页面知道一个点落在按钮上还是落在空白处——按钮
+是 HTML，没有 HWND 可以瞄准，宿主的几何判断看不见它。
 
 Composition 模式下 `VideoWnd` 铺满整个客户区，所以不能让它吃掉鼠标：
 
 - `BrowserWnd::WM_NCHITTEST` 对整个客户区返回 `HTCLIENT`，把所有鼠标消息收进
-  自己的 `WndProc`，再手动分派（返回 `HTTRANSPARENT` 会让系统把命中测试交给别的
-  窗口，消息就永远到不了这里，也就无法有意地转发给任何一方）。
-- 落在挖孔内的点：`MapWindowPoints` 转成 `VideoWnd` 的坐标后 `SendMessageW` 过去。
-- 其余的点：`ICoreWebView2CompositionController::SendMouseInput`，坐标是
-  WebView2 本地坐标，keys 用 `GET_KEYSTATE_WPARAM`。
+  自己的 `WndProc`，再一律转给 WebView2（返回 `HTTRANSPARENT` 会让系统把命中测试
+  交给别的窗口，消息就永远到不了这里）。**没有按挖孔分派的分支。**
+- 鼠标走 legacy `WM_MOUSE*`（本进程没启用 mouse-in-pointer），用
+  `ICoreWebView2CompositionController::SendMouseInput` 转发，坐标是 WebView2 本地
+  坐标，keys 用 `GET_KEYSTATE_WPARAM`。
 - `WM_MOUSEWHEEL` / `WM_MOUSEHWHEEL` 的 lParam 是**屏幕坐标**，得先 `ScreenToClient`。
-- 本进程没有启用 mouse-in-pointer，所以鼠标走 legacy `WM_MOUSE*`；上面的
-  `WM_POINTER*` 分支只处理触摸和笔。
+- `WM_POINTER*` 分支只处理触摸和笔。
 
-Windowed 模式下页面有自己的 HWND 直接吃鼠标，上面这套只对 composition 路径生效。
-唯一的例外是挖孔：`VideoWnd` 被裁到挖孔尺寸并且压在最上层，此时它的客户区不会比
-画面本身更大，所以在 `WM_NCHITTEST` 里返回 `HTCLIENT`——能命中的点击本来就属于
-GIF，正好用来切换暂停。判断方式是「客户区尺寸 == 画面尺寸」：铺满整个客户区时
-（composition）两者必然不等，于是返回 `HTTRANSPARENT`，把消息让给 `BrowserWnd`。
+Windowed 模式下页面自己的 HWND 直接吃鼠标，上面这套不参与。
+
+### 那"点挖孔暂停 GIF"怎么走
+
+由页面决定，而不是靠宿主量几何：
+
+- 页面有一个不可见的 `.video-hit` 盖住挖孔，`z-index: 0`——在渐变背景（`-1`）
+  之上、所有卡片（`1`）之下。压在圆上的控件仍然先拿到点击，只有圆内**空白**部分
+  落到它上面。
+- 它 `postMessage('video-toggle')`，宿主 `BrowserWnd::OnWebMessage()` 收到后
+  `PostMessageW(m_videoWnd, WM_LBUTTONDOWN)`，`GifAnimator::TogglePaused()`。
+
+`VideoWnd::WM_NCHITTEST` 固定返回 `HTTRANSPARENT`：它的客户区现在就是整个客户区，
+认领 `HTCLIENT` 会吞掉本该属于页面的消息。
+
+这样两种模式共用同一份页面代码：composition 由 `BrowserWnd` 收下再转发，
+windowed 由页面自己的 HWND 直接收。
+
+详细验证见 `docs/click-routing-verification.md`。
 
 ## 6. 暂停 / 继续
 
-单击挖孔内的 GIF 区域会 `GifAnimator::TogglePaused()`，再点一次继续。暂停期间
-`Advance()` 直接返回当前帧号（不累加时钟，所以恢复后从当前帧继续，而不是"补播"
-暂停期间的时间）。画面左上角会画一个暂停角标，避免把冻结误认为卡顿。
+单击挖孔内的**空白**处（即落在 `.video-hit` 上的点击，见第 5 节）会
+`GifAnimator::TogglePaused()`，再点一次继续。暂停期间 `Advance()` 直接返回当前
+帧号（不累加时钟，所以恢复后从当前帧继续，而不是"补播"暂停期间的时间）。画面
+左上角会画一个暂停角标，避免把冻结误认为卡顿。
 
 `VideoWnd::OnPaint()` 用 `DrawBitmap(..., NEAREST_NEIGHBOR)` 且 origin 取 `floor()`，
 保证 1:1 拷贝落在整像素上——半像素偏移会重采样，把 1:1 的画面糊掉。
@@ -139,9 +188,11 @@ GIF，正好用来切换暂停。判断方式是「客户区尺寸 == 画面尺�
 
 ## 8. 已知限制
 
-- **窗口模式下挖孔不是真正的 alpha 穿透**，而是"贴在页面上方的原生窗口"。视觉结果
-  一致，但如果有人把 `VideoWnd` 的窗口区域和页面挖孔位置调不一致，就会看到错位。
-- 切模式会重载页面（controller 重建），页面内状态丢失。
+- **窗口模式下依赖 Chromium 的内部窗口结构**：`VideoWnd` 会被重挂到
+  `Chrome_WidgetWin_1` 下并压到最底。这是实测出来的结构，Chromium 版本升级后窗口
+  命名或嵌套方式若变化，`FindPageWnd()` / `VideoStackSettled()` 可能失效；届时的
+  表现是 GIF 又被页面盖住。`ArmVideoStackWatch()` 有次数上限，不会死循环。
+- 切模式会重载页面（controller 重建），页面内状态（计数等）丢失。
 - `VideoWnd::OnPaint()` 在 `D2DERR_RECREATE_TARGET` 时重建 render target，但
   `GifAnimator` 里绑定旧 render target 的位图没有重新加载，设备丢失后 GIF 会变
   空白。修法是把 `GifAnimator::Load` 改成幂等重载（本次未做）。

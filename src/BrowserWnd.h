@@ -28,15 +28,15 @@
 //                 switchable because the two paths differ in how they behave
 //                 during a live resize drag.
 //
-// Pointer routing (all decided here, not by the OS):
-//   - WM_NCHITTEST claims the whole client area (HTCLIENT), so every mouse
-//     message lands in this WndProc.
-//   - A point inside the cut-out rectangle is forwarded to VideoWnd, which
-//     draws the GIF showing through it.
-//   - Anywhere else it goes to the WebView2 via
-//     ICoreWebView2CompositionController::SendMouseInput. In windowed mode the
-//     WebView2's own child HWND sits on top and takes the mouse directly, so
-//     this hand-rolled routing only applies to the composition path.
+// Pointer routing:
+//   - In composition mode WM_NCHITTEST claims the whole client area (HTCLIENT),
+//     so every mouse message lands in this WndProc and is handed to the
+//     WebView2 through SendMouseInput. In windowed mode the page's own child
+//     HWND takes the mouse directly and none of this runs.
+//   - Nothing is routed by geometry. Only the page knows whether a point is
+//     over a button or over empty space, so the page carries an invisible
+//     element over the cut-out and postMessage()s us when a click lands there.
+//     That is what toggles the GIF, via OnWebMessage().
 class BrowserWnd
 {
 public:
@@ -84,12 +84,39 @@ private:
     void UpdateVisualBounds();
     void UpdateWebViewBounds();
 
-    // Size and stack VideoWnd for the current mode. See the definition for why
-    // the two modes need different geometry to produce the same picture.
+    // Size, parent and stack VideoWnd for the current mode. See the definition
+    // for why the two modes need different geometry to produce the same picture.
     void LayoutVideoWnd();
+
+    // The window the windowed controller actually paints the page into. The
+    // controller nests its windows below us, so this is the innermost
+    // Chrome_WidgetWin_* descendant: BrowserWnd > Chrome_WidgetWin_0 >
+    // Chrome_WidgetWin_1. VideoWnd is re-parented into it so the page and the
+    // GIF are siblings and their z-order is ours to set. Null before the
+    // controller is up, or in composition mode.
+    HWND FindPageWnd() const;
+
+    // True once the windowed stack needs no further attention: the window
+    // Chromium presents the page through exists, and VideoWnd is the bottom-most
+    // child of the page window (so the page draws over it). False while the
+    // stack is still missing or ordered wrong.
+    bool VideoStackSettled() const;
+
+    // Re-assert the windowed stack until it settles or the retries run out.
+    // Chromium creates the presenting window some time *after* the controller
+    // returns, and it lands on top of VideoWnd, so the single layout done in
+    // SetupController is always too early - which is why the picture only came
+    // right after a resize. Not a repeating poll: each call arms a short timer
+    // that stops as soon as VideoStackSettled() is true.
+    void ArmVideoStackWatch();
 
     HRESULT InitDComp();
     HRESULT InitWebView2();
+
+    // Attach or detach the DComp visual tree from the composition target.
+    // Detaching is what keeps a stale composition frame from sitting on top of
+    // the windowed controller's HWND.
+    void AttachRootVisual(bool attach);
 
     // Async-completion callbacks from WebView2.
     void OnEnvCreated(HRESULT hr, ICoreWebView2Environment* env);
@@ -107,11 +134,11 @@ private:
     void TeardownController();
 
 
-    // The transparent cut-out the GIF shows through, in client pixels. Used by
-    // WM_NCHITTEST to decide whether a point belongs to the page or to the
-    // native video window underneath.
-    RECT VideoRectPx() const;
-    bool IsInVideoRect(POINT pt) const;
+    // Handle window.chrome.webview.postMessage() from the page. The page is the
+    // only side that knows what is actually under a point, so it - not the host
+    // - decides whether a click inside the cut-out belongs to a page control or
+    // to the GIF, and tells us when it is the GIF's turn.
+    void OnWebMessage(const std::wstring& json);
 
     bool m_initialized = false;
 
@@ -127,19 +154,18 @@ private:
     HWND m_videoWnd = nullptr;
     std::wstring m_url;
 
+    // Stack watch: see ArmVideoStackWatch(). kVideoStackWatchTicks bounds how
+    // long it keeps trying, so a Chromium that never builds the expected tree
+    // cannot leave a timer running forever.
+    static constexpr UINT_PTR kVideoStackWatchTimer = 1;
+    static constexpr int kVideoStackWatchTicks = 20;
+    int m_videoStackTicksLeft = 0;
+
     Mode m_mode = Mode::Composition;
     // True between CreateControllerForMode() and its completion handler, so a
     // second click cannot tear down a controller that is still being built.
     bool m_switchInFlight = false;
     std::function<void(Mode)> m_onModeChanged;
-
-    // The cut-out is the GIF's own rectangle, centred in the client area, and
-    // VideoWnd draws the GIF 1:1 inside it. Sizes are in CSS pixels: the
-    // WebView2 rasterization scale is pinned to 1.0 (see OnControllerCreated)
-    // so CSS pixels and physical pixels are 1:1, and these map onto
-    // --video-w / --video-h in style.css. Keep the two in sync.
-    static constexpr double kVideoWidthCss  = 648.0;
-    static constexpr double kVideoHeightCss = 338.0;
 
     // DComp
     Microsoft::WRL::ComPtr<IDCompositionDevice> m_dcompDevice;
@@ -161,9 +187,11 @@ private:
     Microsoft::WRL::ComPtr<EnvCompletedHandler> m_envHandler;
     Microsoft::WRL::ComPtr<ControllerCompletedHandler> m_ctrlHandler;
     Microsoft::WRL::ComPtr<WindowedControllerCompletedHandler> m_winCtrlHandler;
+    Microsoft::WRL::ComPtr<WebMessageHandler> m_msgHandler;
 
     // Kept so the handler can be detached before the controller goes away.
     EventRegistrationToken m_navToken{};
     EventRegistrationToken m_accelToken{};
     EventRegistrationToken m_rasterToken{};
+    EventRegistrationToken m_msgToken{};
 };
