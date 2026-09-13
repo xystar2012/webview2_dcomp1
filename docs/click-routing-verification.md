@@ -81,17 +81,24 @@ webview2_dcomp1.BrowserWnd
    `LayoutVideoWnd()` 一定早于它，于是它一出现就把 `VideoWnd` 盖住了——表现就是
    **只有 resize 过主窗口才正常**（resize 会再跑一次布局）。
 
-修法是 `ArmVideoStackWatch()`：起一个 250ms 的定时器，最多 20 次，反复重新布局，
-直到 `VideoStackSettled()` 为真——判据是 `Intermediate D3D Window` 已存在**且**
-`VideoWnd` 是该窗口子链的最后一项（`GW_HWNDNEXT` 走到头）。settle 了就 `KillTimer`，
-不做常驻轮询。`Resize()` / `SetMode()` 也会调 `LayoutVideoWnd()`。
-
 尺寸取**自己的** `GetClientRect()`，不取目标窗口的：`Chrome_WidgetWin_1` 在初始化
 中途会报出 1608×1529 的临时客户区，照着它给 `VideoWnd` 就会捅到窗口外面去；
 Chromium 之后才收敛到真正的 1078×700。
 
-日志里的证据链：`settled=0` →（定时器重试）→ `settled=1` →
-`VideoWnd stack settled; watch stopped`，且全程没有 resize。
+**定局的那次布局放在 `OnNavCompleted()`。** 原先用一个上限 20 次、250ms 的
+`ArmVideoStackWatch()` 定时器反复重排直到 `VideoStackSettled()` 为真；后来测出
+`NavigationCompleted` 就是第一个能看见完整窗口树的回调，定时器随即删除。在三个
+回调点各打一次探针，看到的东西是：
+
+| 回调 | 页面窗口子项 | 呈现窗口存在 | `VideoWnd` 在最底 |
+|---|---|---|---|
+| controller 创建完成 | 1 | 否 | 否 |
+| `SetupController()` 结束 | 2 | 否 | 是 |
+| `NavigationCompleted` | 3 | **是** | **否** ← 被呈现窗口压住 |
+
+于是在 `OnNavCompleted()` 里重排一次即可，且不需要轮询——呈现窗口不可能在它所呈现
+的那次导航结束之后才出现。日志里的证据链：`settled=0`（`SetupController`）→
+`settled=1`（`OnNavCompleted`），且全程没有 resize、之后也没有任何定时器动作。
 
 ---
 

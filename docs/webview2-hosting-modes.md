@@ -115,18 +115,29 @@ webview2_dcomp1.BrowserWnd
 - `SetMode()` 里 `m_mode` 改变之后——旧 controller 已经拆掉，立刻摆放可以让
   GIF 在重建期间不闪空；
 - `SetupController()` 里 `put_Bounds()` 之后、`put_IsVisible(TRUE)` 之前；
-- `ArmVideoStackWatch()` 的 250ms 定时器——见下。
+- `OnNavCompleted()`——**定局的那一次**，见下。
 
 > **不能挂在 `Chrome_WidgetWin_0` 下。** 试过：挂在那里并压到最底，GIF 会**冻住**
 > （前后两张截图逐字节相同）。被上面那层不透明的兄弟窗口完全覆盖后，DWM 判定它
 > 不可见、不再重合成。挂在 `Chrome_WidgetWin_1` 下就好了，因为压住它的是分层的
 > `Intermediate D3D Window`，带 alpha，混合照常。
 >
-> **`Intermediate D3D Window` 是后建的。** `SetupController()` 里那次布局一定早于
-> 它，于是它一出现就把 `VideoWnd` 盖住——表现是**只有 resize 过主窗口才正常**
-> （resize 会再跑一次布局）。`ArmVideoStackWatch()` 用定时器反复重排直到
-> `VideoStackSettled()` 为真（该窗口已存在**且** `VideoWnd` 是子链最后一项），
-> settle 后即 `KillTimer`，不是常驻轮询。
+> **`Intermediate D3D Window` 是后建的，且建在 `VideoWnd` 之上。**
+> `SetupController()` 里那次布局一定早于它，于是它一出现就把 `VideoWnd` 盖住
+> ——表现是**只有 resize 过主窗口才正常**（resize 会再跑一次布局）。
+>
+> 定局交给 `OnNavCompleted()`：那是第一个能看见完整窗口树的生命周期回调。实测三次
+> 回调各自看到的东西：
+>
+> | 回调 | 页面窗口子项 | 呈现窗口存在 | `VideoWnd` 在最底 |
+> |---|---|---|---|
+> | controller 创建完成 | 1 | 否 | 否 |
+> | `SetupController()` 结束 | 2 | 否 | 是 |
+> | `NavigationCompleted` | 3 | **是** | **否** ← 被呈现窗口压住 |
+>
+> 于是在 `OnNavCompleted()` 里重排一次就够，且**无需轮询**：呈现窗口不可能在它所
+> 呈现的那次导航结束之后才出现。（早期版本用一个上限 20 次、250ms 的
+> `ArmVideoStackWatch()` 定时器兜底，现已删除。）
 
 尺寸取**自己的** `GetClientRect()`：`Chrome_WidgetWin_1` 初始化中途会报出
 1608×1529 的临时客户区，照它给尺寸会让 `VideoWnd` 捅到窗口外。
@@ -191,7 +202,8 @@ windowed 由页面自己的 HWND 直接收。
 - **窗口模式下依赖 Chromium 的内部窗口结构**：`VideoWnd` 会被重挂到
   `Chrome_WidgetWin_1` 下并压到最底。这是实测出来的结构，Chromium 版本升级后窗口
   命名或嵌套方式若变化，`FindPageWnd()` / `VideoStackSettled()` 可能失效；届时的
-  表现是 GIF 又被页面盖住。`ArmVideoStackWatch()` 有次数上限，不会死循环。
+  表现是 GIF 又被页面盖住。因为已经去掉定时器，**没有自动重试兜底**——真出现的话
+  拖一下窗口（`Resize()` 会再排一次）即可恢复，根因还要再查。
 - 切模式会重载页面（controller 重建），页面内状态（计数等）丢失。
 - `VideoWnd::OnPaint()` 在 `D2DERR_RECREATE_TARGET` 时重建 render target，但
   `GifAnimator` 里绑定旧 render target 的位图没有重新加载，设备丢失后 GIF 会变

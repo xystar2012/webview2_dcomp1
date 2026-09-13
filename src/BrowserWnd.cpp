@@ -257,13 +257,6 @@ bool BrowserWnd::VideoStackSettled() const
     return sawPresenter && last == m_videoWnd;
 }
 
-void BrowserWnd::ArmVideoStackWatch()
-{
-    if (!m_hwnd || m_mode != Mode::Windowed) return;
-    m_videoStackTicksLeft = kVideoStackWatchTicks;
-    SetTimer(m_hwnd, kVideoStackWatchTimer, 250, nullptr);
-}
-
 void BrowserWnd::AttachRootVisual(bool attach)
 {
     if (!m_dcompTarget) return;
@@ -529,10 +522,9 @@ void BrowserWnd::SetupController()
     //    above so there is no window left at the wrong size, and before
     //    put_IsVisible() below so the GIF window is already in place when the
     //    controller first shows.
+    // Chromium's presenting window does not exist yet, so this is only a
+    // provisional layout; OnNavCompleted() re-asserts it once it does.
     LayoutVideoWnd();
-    // Chromium has not built its presenting window yet at this point, so this
-    // layout cannot be the last word; keep re-asserting until it exists.
-    ArmVideoStackWatch();
 
     // 5) Controllers start hidden. Show explicitly so the first frame goes
     //    through.
@@ -589,14 +581,6 @@ void BrowserWnd::TeardownController()
 {
     if (!m_controller) return;
     dlog(L"[BrowserWnd] TeardownController");
-
-    // The stack it was watching is about to disappear; the next controller
-    // arms its own watch.
-    if (m_hwnd)
-    {
-        KillTimer(m_hwnd, kVideoStackWatchTimer);
-        m_videoStackTicksLeft = 0;
-    }
 
     // Detach the root visual first. Closing the composition controller does
     // not clear m_rootVisual, and an attached visual keeps the last frame
@@ -683,9 +667,8 @@ void BrowserWnd::SetMode(Mode mode)
     // Move VideoWnd straight away rather than waiting for the new controller:
     // the old one is already gone, so in windowed mode this keeps the GIF in
     // the cut-out through the rebuild instead of letting the whole client area
-    // flash empty.
+    // flash empty. The new controller's completion path re-lays it out.
     LayoutVideoWnd();
-    ArmVideoStackWatch();
     if (m_onModeChanged) m_onModeChanged(m_mode);
     CreateControllerForMode();
 }
@@ -750,6 +733,23 @@ void BrowserWnd::OnNavCompleted(HRESULT status)
     wchar_t buf[128];
     std::swprintf(buf, 128, L"[BrowserWnd] NavCompleted status=0x%08lx", (unsigned long)status);
     dlog(buf);
+
+    // The one moment the windowed stack can be settled for good. Chromium
+    // creates `Intermediate D3D Window` - the window that actually presents the
+    // page - while the navigation loads, *after* the controller callback that
+    // did the provisional layout in SetupController(), and it is created on top
+    // of VideoWnd. Measured order of first sight:
+    //
+    //   controller created   page wnd exists, 1 child,  no presenter
+    //   SetupController()    2 children,       no presenter, VideoWnd bottom
+    //   NavigationCompleted  3 children,       presenter present, VideoWnd covered
+    //
+    // So this is the first callback that sees a complete tree, and it has to
+    // re-assert VideoWnd to the bottom. Nothing has to be polled for: the
+    // presenter cannot appear after the navigation it presents has finished,
+    // which is why this replaced a bounded 250ms retry timer.
+    LayoutVideoWnd();
+
     if (m_webView)
     {
         LPWSTR src = nullptr;
@@ -857,28 +857,6 @@ LRESULT BrowserWnd::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
     {
-    case WM_TIMER:
-        if (wp == kVideoStackWatchTimer)
-        {
-            // The stack is only worth re-asserting while it is still wrong;
-            // once it settles, drop the timer rather than fight Chromium.
-            if (m_mode == Mode::Windowed &&
-                !VideoStackSettled() &&
-                m_videoStackTicksLeft > 0)
-            {
-                --m_videoStackTicksLeft;
-                LayoutVideoWnd();
-            }
-            else
-            {
-                KillTimer(h, kVideoStackWatchTimer);
-                m_videoStackTicksLeft = 0;
-                dlog(L"[BrowserWnd] VideoWnd stack settled; watch stopped");
-            }
-            return 0;
-        }
-        break;
-
     case WM_PAINT:
     {
         PAINTSTRUCT ps;

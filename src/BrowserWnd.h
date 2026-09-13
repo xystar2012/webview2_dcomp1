@@ -22,11 +22,11 @@
 //
 //   Windowed    - the classic ICoreWebView2Controller, which creates an opaque
 //                 child HWND of this window. There is no per-pixel alpha to
-//                 punch a hole with, so instead VideoWnd is shrunk to the
-//                 cut-out rectangle and kept above that HWND: the GIF is drawn
-//                 by a real native window sitting on top of the page. Kept
-//                 switchable because the two paths differ in how they behave
-//                 during a live resize drag.
+//                 punch a hole with, so VideoWnd is re-parented in beside the
+//                 window that paints the page and pushed to the bottom of that
+//                 order; the compositor then blends the page's alpha over it.
+//                 Kept switchable because the two paths differ in how they
+//                 behave during a live resize drag.
 //
 // Pointer routing:
 //   - In composition mode WM_NCHITTEST claims the whole client area (HTCLIENT),
@@ -99,16 +99,9 @@ private:
     // True once the windowed stack needs no further attention: the window
     // Chromium presents the page through exists, and VideoWnd is the bottom-most
     // child of the page window (so the page draws over it). False while the
-    // stack is still missing or ordered wrong.
+    // stack is still missing or ordered wrong. Feeds the layout log line - it is
+    // the readout for whether the stack is where it should be.
     bool VideoStackSettled() const;
-
-    // Re-assert the windowed stack until it settles or the retries run out.
-    // Chromium creates the presenting window some time *after* the controller
-    // returns, and it lands on top of VideoWnd, so the single layout done in
-    // SetupController is always too early - which is why the picture only came
-    // right after a resize. Not a repeating poll: each call arms a short timer
-    // that stops as soon as VideoStackSettled() is true.
-    void ArmVideoStackWatch();
 
     HRESULT InitDComp();
     HRESULT InitWebView2();
@@ -153,13 +146,6 @@ private:
     HWND m_hwnd = nullptr;
     HWND m_videoWnd = nullptr;
     std::wstring m_url;
-
-    // Stack watch: see ArmVideoStackWatch(). kVideoStackWatchTicks bounds how
-    // long it keeps trying, so a Chromium that never builds the expected tree
-    // cannot leave a timer running forever.
-    static constexpr UINT_PTR kVideoStackWatchTimer = 1;
-    static constexpr int kVideoStackWatchTicks = 20;
-    int m_videoStackTicksLeft = 0;
 
     Mode m_mode = Mode::Composition;
     // True between CreateControllerForMode() and its completion handler, so a

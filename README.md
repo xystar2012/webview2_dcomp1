@@ -98,12 +98,17 @@ Two things make this fiddly, both measured rather than assumed:
   byte-identical). A child fully covered by a sibling DWM treats as opaque stops
   being recomposited. Under `Chrome_WidgetWin_1` it stays live, because the
   window covering it — `Intermediate D3D Window` — is layered and carries alpha.
-* **That window is created late.** Chromium builds it *after* the controller
-  returns, so it lands on top of `VideoWnd` and the layout done during setup is
-  always too early. The symptom was that the page only rendered correctly after
-  resizing the main window. `ArmVideoStackWatch()` re-asserts the stack on a
-  250ms timer, bounded to 20 ticks, until the presenting window exists and
-  `VideoWnd` is bottom-most — then kills the timer. Not a permanent poll.
+* **That window is created late, and on top of `VideoWnd`.** Chromium builds it
+  *after* the controller returns, so the layout done during setup is always too
+  early. The symptom was that the page only rendered correctly after resizing
+  the main window. `NavigationCompleted` is the first callback that sees a
+  complete tree — measured: the controller callback sees 1 child of the page
+  window and no presenting window, `SetupController()` sees 2 and none, and
+  `NavigationCompleted` sees 3 with the presenting window already covering
+  `VideoWnd`. So `OnNavCompleted()` re-asserts the stack once. Nothing is
+  polled: the presenting window cannot appear after the navigation it presents
+  has finished. (An earlier version used a bounded 250ms retry timer,
+  `ArmVideoStackWatch()`; it is gone.)
 
 `VideoWnd` is sized from `BrowserWnd`'s own client rect, never from the target
 window's: queried mid-init, `Chrome_WidgetWin_1` reports a bogus 1608×1529 client
@@ -288,15 +293,15 @@ git-ignored).
 * `kStripHeight` in [`src/MainWnd.h`](src/MainWnd.h) — bottom strip height.
 * `kTimerMs` in [`src/VideoWnd.cpp`](src/VideoWnd.cpp) — GIF frame cadence
   (16ms, ~60Hz).
-* `kVideoStackWatchTicks` in [`src/BrowserWnd.h`](src/BrowserWnd.h) — how many
-  250ms retries the windowed stack gets before the watch gives up.
 
 ## Known limits
 
 * Windowed mode depends on Chromium's internal window structure
   (`Chrome_WidgetWin_*`, `Intermediate D3D Window`). A future WebView2 runtime
   could rename or restructure them; the symptom would be the GIF being covered by
-  the page again. `ArmVideoStackWatch()` is bounded, so it cannot loop forever.
+  the page again. There is no retry fallback any more — dragging the window
+  recovers it (`Resize()` re-runs the layout), but the cause would still need
+  chasing.
 * Switching modes reloads the page and resets page state.
 * On `D2DERR_RECREATE_TARGET` `VideoWnd` rebuilds its render target, but
   `GifAnimator`'s bitmaps are bound to the old one and are not reloaded — after a

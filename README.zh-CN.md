@@ -89,10 +89,14 @@ C++ 侧**故意**不留副本：宿主已经不按几何分派点击，也就没
 * **不能挂在 `Chrome_WidgetWin_0` 下。** 试过：GIF 会冻住（两张截图逐字节相同）。
   被同级窗口完全覆盖后，DWM 判定它不可见、不再重合成。挂在 `Chrome_WidgetWin_1`
   下就正常，因为压住它的 `Intermediate D3D Window` 是分层窗口、带 alpha。
-* **那个窗口是后建的。** Chromium 在 controller 返回**之后**才建它，于是它落到
-  `VideoWnd` 上面，初始化时做的那次布局必然太早。表现就是**只有 resize 过主窗口，
-  页面才渲染正常**。`ArmVideoStackWatch()` 用 250ms 定时器、上限 20 次重新摆放，
-  直到呈现窗口存在且 `VideoWnd` 位于最底，然后杀掉定时器。不是常驻轮询。
+* **那个窗口是后建的，而且建在 `VideoWnd` 之上。** Chromium 在 controller 返回
+  **之后**才建它，于是初始化时做的那次布局必然太早。表现就是**只有 resize 过主窗口，
+  页面才渲染正常**。定局交给 `NavigationCompleted`：那是第一个能看见完整窗口树的
+  回调。实测三点——controller 创建完成时页面窗口只有 1 个子项、呈现窗口不存在；
+  `SetupController()` 结束时 2 个子项、呈现窗口仍不存在；`NavigationCompleted` 时
+  3 个子项、呈现窗口已存在且已盖住 `VideoWnd`。所以在 `OnNavCompleted()` 里重排
+  一次即可，**无需轮询**：呈现窗口不可能在它所呈现的那次导航结束之后才出现。
+  （早期版本用一个上限 20 次、250ms 的 `ArmVideoStackWatch()` 定时器兜底，已删除。）
 
 `VideoWnd` 的尺寸取 `BrowserWnd` 自己的客户区，绝不取目标窗口的：初始化中途
 `Chrome_WidgetWin_1` 会报出一个 1608×1529 的错误客户区，照着它给尺寸窗口会捅到
@@ -259,14 +263,13 @@ powershell -File <repo>\tools\verify-click-routing.ps1 -Mode Windowed
 * [`html/style.css`](html/style.css) 里的渐变配色与布局。
 * [`src/MainWnd.h`](src/MainWnd.h) 里的 `kStripHeight`——底部条带高度。
 * [`src/VideoWnd.cpp`](src/VideoWnd.cpp) 里的 `kTimerMs`——GIF 帧间隔（16ms，约 60Hz）。
-* [`src/BrowserWnd.h`](src/BrowserWnd.h) 里的 `kVideoStackWatchTicks`——windowed 叠层
-  在放弃前重试多少个 250ms。
 
 ## 已知限制
 
 * windowed 模式依赖 Chromium 的内部窗口结构（`Chrome_WidgetWin_*`、
   `Intermediate D3D Window`）。将来的 WebView2 Runtime 若改名或改结构，症状会是 GIF
-  又被页面盖住。`ArmVideoStackWatch()` 有次数上限，不会死循环。
+  又被页面盖住。已经没有重试兜底了——拖一下窗口即可恢复（`Resize()` 会再排一次），
+  但根因还得再查。
 * 切模式会重载页面，页面内状态归零。
 * 设备丢失（`D2DERR_RECREATE_TARGET`）时 `VideoWnd` 会重建 render target，但
   `GifAnimator` 的位图绑在旧的那个上、没有重载——设备丢失后 GIF 会变空白。修法是让
