@@ -18,6 +18,16 @@
 | **点击路由** | 宿主**不**按几何判断点击归属，由页面判断并 `postMessage` 告诉宿主。 |
 | **`tools/verify-click-routing.ps1`** | 自动化端到端验证：打真实点击，量真实结果。 |
 
+## 效果图
+
+![运行时录制：单击、暂停/继续、切换托管模式](docs/demo.gif)
+
+由 [`tools/record-demo.ps1`](tools/record-demo.ps1) 录制。全过程：连点 A 两次、
+B 一次；点圆盘空白处暂停；再点一次继续；点底部条带按钮切到 windowed 模式；在
+windowed 模式下再点 A、B 各一次。计数从 `0` → `3`，切模式时归零（页面重载），
+windowed 模式下重新计到 `2`；底部条带显示当前模式。全程两种模式下 GIF 都在圆盘里
+正常播放。
+
 ## 结构
 
 ```
@@ -237,13 +247,16 @@ powershell -File <repo>\tools\verify-click-routing.ps1 -Mode Windowed
 ├── README.zh-CN.md
 ├── marketplace.gif                  # 在挖孔里绘制的动图
 ├── docs/
+│   ├── demo.gif                     # 录制效果：单击、暂停、切换模式
 │   ├── webview2-hosting-modes.md
 │   └── click-routing-verification.md
 ├── html/
 │   ├── index.html                   # 载入 WebView2 的页面
 │   └── style.css                    # 圆盘遮罩、渐变环、卡片
 ├── tools/
-│   └── verify-click-routing.ps1     # 端到端点击/动画检查
+│   ├── verify-click-routing.ps1     # 端到端点击/动画检查
+│   ├── record-demo.ps1              # 跑一遍脚本化流程并逐帧截图
+│   └── build-demo-gif.py            # 把这些帧拼成 docs/demo.gif
 └── src/
     ├── main.cpp                     # wWinMain、消息循环
     ├── App.{h,cpp}                  # DPI、COM、路径、file:// URL

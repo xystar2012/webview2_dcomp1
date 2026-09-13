@@ -17,6 +17,17 @@ very differently and the difference is worth seeing side by side.
 | **Pointer routing** | The host does **not** decide click ownership by geometry. The page does, and tells the host through `postMessage`. |
 | **`tools/verify-click-routing.ps1`** | Automated end-to-end check: drives real clicks and measures the result. |
 
+## Demo
+
+![Runtime demo: clicks, pause/resume, and the hosting-mode switch](docs/demo.gif)
+
+Recorded with [`tools/record-demo.ps1`](tools/record-demo.ps1). The run: click A
+twice and B once, click the empty part of the cut-out to pause, click again to
+resume, switch to windowed mode with the strip button, then click A and B again
+there. The counters go `0` → `3`, reset to `0` across the switch (the page
+reloads), and reach `2` in windowed mode; the strip shows which mode is live.
+The GIF is animating through the cut-out the whole way, in both modes.
+
 ## Architecture
 
 ```
@@ -265,13 +276,16 @@ git-ignored).
 ├── README.zh-CN.md
 ├── marketplace.gif                  # the animated GIF drawn in the cut-out
 ├── docs/
+│   ├── demo.gif                     # recorded run: clicks, pause, mode switch
 │   ├── webview2-hosting-modes.md
 │   └── click-routing-verification.md
 ├── html/
 │   ├── index.html                   # page loaded into WebView2
 │   └── style.css                    # disc mask, gradient ring, cards
 ├── tools/
-│   └── verify-click-routing.ps1     # end-to-end click/animation check
+│   ├── verify-click-routing.ps1     # end-to-end click/animation check
+│   ├── record-demo.ps1              # drives the scripted run and captures it
+│   └── build-demo-gif.py            # assembles those frames into docs/demo.gif
 └── src/
     ├── main.cpp                     # wWinMain, message loop
     ├── App.{h,cpp}                  # DPI, COM, paths, the file:// URL
