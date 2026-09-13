@@ -1,0 +1,15 @@
+# Build tree (CMake, MSBuild, VS cache)
+build/
+out/
+.vs/
+CMakeCache.txt
+CMakeFiles/
+
+# Local debug / build logs
+*.log
+
+# Scratch captures and reproduction sheets made while chasing rendering bugs
+*.png
+
+# Tooling state
+.claude/

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebView2 + DirectComposition</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="page-header">
+    <h1 id="title">Composition Demo</h1>
+    <p class="subtitle">
+      This page is composited by DirectComposition over a native child window.
+      The 648x338 rectangle in the middle is a real hole in this page - the
+      moving GIF you see through it is drawn by the layer underneath, not by
+      the browser.
+    </p>
+  </header>
+
+  <section class="card card-left">
+    <h2>Top layer - WebView2</h2>
+    <p>Everything on the ring: this text, the cards and the gradient.</p>
+    <ul>
+      <li>DComp target: <code>BrowserWnd</code></li>
+      <li>Bounds mode: <code>RAW_PIXELS</code></li>
+      <li>Rasterization scale: <code>1.0</code></li>
+      <li>Default background: <code>{0,0,0,0}</code></li>
+    </ul>
+    <p class="hint">Controls placed inside the cut-out are not clickable: BrowserWnd forwards those points straight to VideoWnd. Put controls outside the cut-out, like this card.</p>
+  </section>
+
+  <section class="card card-right">
+    <h2>Bottom layer - VideoWnd</h2>
+    <p>An animated GIF on an <code>ID2D1HwndRenderTarget</code>, in a child HWND below this visual.</p>
+    <ul>
+      <li>Frames: <code>110</code></li>
+      <li>Cadence: <code>~60 Hz</code></li>
+      <li>Drawn 1:1 inside the cut-out</li>
+    </ul>
+    <p class="hint">Because the WebView2 visual is transparent inside the cut-out, DirectComposition lets the GIF through - pixel for pixel.</p>
+  </section>
+
+  <section class="card card-actions">
+    <h2>Click test</h2>
+    <p class="hint">These buttons sit outside the cut-out, so pointer events reach the WebView2 and the page handles them.</p>
+    <div class="btn-row">
+      <button class="btn" id="btn-a" type="button">Button A</button>
+      <button class="btn" id="btn-b" type="button">Button B</button>
+      <button class="btn" id="btn-c" type="button">Button C</button>
+    </div>
+    <p class="counts">A: <b id="cnt-a">0</b> &middot; B: <b id="cnt-b">0</b> &middot; C: <b id="cnt-c">0</b> &middot; Total: <b id="cnt-total">0</b></p>
+  </section>
+
+  <footer class="page-footer">WebView2 + DirectComposition three-layer demo</footer>
+
+  <script>
+    // style.css uses --video-w / --video-h for the size of the transparent
+    // cut-out, in CSS pixels, and VideoWnd draws the GIF 1:1 inside it. The
+    // WebView2 rasterization scale is pinned to 1.0 so CSS pixels are 1:1 with
+    // physical pixels, which is exactly the unit BrowserWnd::kVideoWidthCss /
+    // kVideoHeightCss (used by IsInVideoRect for hit testing) work in. Keep
+    // the two in sync.
+    document.documentElement.style.setProperty('--video-w', '648px');
+    document.documentElement.style.setProperty('--video-h', '338px');
+
+    // Per-button click counters plus a running total. These live outside the
+    // cut-out, so the clicks arrive through the normal Win32 -> WebView2 path;
+    // if the numbers move, hit testing and pointer forwarding both work.
+    (function () {
+      const keys = ['a', 'b', 'c'];
+      const counts = { a: 0, b: 0, c: 0 };
+      let total = 0;
+      for (const k of keys) {
+        document.getElementById('btn-' + k).addEventListener('click', () => {
+          counts[k] += 1;
+          total += 1;
+          document.getElementById('cnt-' + k).textContent = counts[k];
+          document.getElementById('cnt-total').textContent = total;
+        });
+      }
+    })();
+  </script>
+</body>
+</html>
